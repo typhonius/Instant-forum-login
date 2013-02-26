@@ -1,0 +1,3 @@
+name = Instant Forum Login 
+description = A simple module to allow users to log in directly without having to enter passwords.
+core = 7.x

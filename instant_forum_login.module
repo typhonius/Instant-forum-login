@@ -1,0 +1,209 @@
+<?php
+
+/**
+ * @file
+ *
+ * Tweaks the Federal site in a number of ways and ties a lot of functionality
+ * together from other modules used on the site.
+ *
+ * Provides:
+ * - Instant forum login tokens and callbacks for specific forum posts
+ * - Drop down login block
+ * - Video block with preview image
+ * - Placeholders for search form
+ * - Apachesolr tweaks for zebra, author and comments
+ * - Collapsiblock integration for search facets
+ * - A few redirects for groups and taxonomy to keep users away from places
+ * we don't want them.
+ *
+ */
+
+/**
+ * Implements hook_menu()
+ *
+ * @return array Returns menu items for config page and instant login callback.
+ */
+function instant_forum_login_menu() {
+  $items['forum/login/%/%/%/%'] = array(
+    'title' => 'Instant Forum Login',
+    'page callback' => 'instant_forum_login_onetime_forum_login',
+    'page arguments' => array(2, 3, 4, 5),
+    'access callback' => TRUE,
+    'type' => MENU_CALLBACK,
+  );
+
+  return $items;
+}
+
+/**
+ * Implements hook_token_info
+ *
+ * @return array Returns the defined tokens as a keyed array 
+ */
+function instant_forum_login_token_info() {
+  $types['instant_forum_login_tokens'] = array(
+    'name' => t('Instant Forum Login Tokens'),
+    'description' => t("Tokens for Instant Forum Login."),
+  );
+
+  $tokens['forum_link'] = array(
+    'name' => t("Forum Link"),
+    'description' => t('A forum link that automatically logs the user in and directs them to a specific forum.'),
+ );
+
+  return array(
+    'types' => $types,
+    'tokens' => array(
+      'instant_forum_login_tokens' => $tokens,
+    ),
+  );
+}
+
+/**
+ * Implements hook_tokens()
+ *
+ * @param string $type
+ * @param array $tokens
+ * @param array $data
+ * @param array $options
+ * @return array Returns the replacement tokens as a keyed array.
+ */
+function instant_forum_login_tokens($type, $tokens, array $data = array(), array $options = array()) {
+  // get data from nid and uid
+  $replacements = array();
+  if ($type == 'instant_forum_login_tokens') {
+    foreach ($tokens as $name => $original) {
+      switch ($name) {
+        case 'forum_link':
+          $nid = $data['node']->nid;
+          $uid = $data['subs']['uid'];
+          $link = instant_forum_login_onetime_forum_link($nid, $uid);
+          if (isset($nid) && isset($uid)) {
+            $replacements[$original] = $link;
+          }
+          else {
+            $replacements[$original] = '';
+          }
+          break;
+      }
+    }
+  }
+  return $replacements;
+}
+
+/**
+ * Processes one time forum access links
+ * 
+ * This function parses the one time login link a user has clicked on and is
+ * called via the menu callback the link points to. It ensures that the link
+ * is genuine, has not been tampered with and validates the link in order to
+ * successfully log the user in. To log in a user and redirect them to the node
+ * that has recently been updated, the user must not have been to that node
+ * before and the link must be less than a week old.
+ * 
+ * @see instant_forum_login_onetime_forum_link()
+ * 
+ * @global type $user
+ * @param int $nid
+ *  The node ID that the user should be forwarded to.
+ * @param int $uid
+ *  The user ID of the user who is being sent the link
+ * @param int $timestamp
+ *  The unix timestamp from which the user has 1 week to have a valid login.
+ * @param string $hash
+ *  A hash of user, node and timestamp data to prevent spoofing links.
+ * 
+ */
+function instant_forum_login_onetime_forum_login($nid, $uid, $timestamp, $hash) {
+
+  global $user;
+  // Check to see if the user is already logged in. If they are, direct them to
+  // the node the link suggests.
+  if ($user->uid) {
+    if ($user->uid == $uid) {
+      drupal_goto('node/' . $nid);
+    }
+    else {
+      // The logged in user is not the user the link was addressed to. Inform the
+      // user of this and give them the option to log out.
+      $reset_link_account = user_load($uid);
+      if (!empty($reset_link_account)) {
+        drupal_set_message(t('Another user (%other_user) is already logged into the site on this computer, but you tried to use a one-time link for user %resetting_user. Please <a href="!logout">logout</a> and try using the link again.', array('%other_user' => $user->name, '%resetting_user' => $reset_link_account->name, '!logout' => url('user/logout'))));
+      }
+      else {
+        // Invalid one-time link specifies an unknown user.
+        drupal_set_message(t('The forum link you clicked is invalid.'));
+      }
+    }
+    drupal_goto();
+  }
+  else {
+    // Time out, in seconds, until login URL expires. Defaults to 1 week
+    // 168 hours = 604800 seconds.
+    $timeout = 604800;
+    $current = REQUEST_TIME;
+    // Some redundant checks for extra security ?
+    $users = user_load_multiple(array($uid), array('status' => '1'));
+    $account = reset($users);
+    if ($account) {
+      // Make sure the link was generated less than a week ago. If it wasn't,
+      // tell the user, and redirect without logging in.
+      if ($current - $timeout > $timestamp ) {
+        drupal_set_message(t('You have tried to use a one-time forum link that has expired. Please sign in.'));
+        drupal_goto('user/login', array('query' => array('destination' => 'node/' . $nid)));
+      }
+      elseif ($account->uid && $timestamp <= $current && $hash == user_pass_rehash($account->pass, $timestamp, $nid)) {
+        // Check the history to see if the user has visited the node before
+        // if they have, make them sign in again, otherwise sign them in and
+        // take them to the node.
+        // Use the node_last_viewed function as inspiration
+
+        $history = &drupal_static(__FUNCTION__, array());
+        if (!isset($history[$nid])) {
+          $history[$nid] = db_query("SELECT timestamp FROM {history} WHERE uid = :uid AND nid = :nid", array(':uid' => $account->uid, ':nid' => $nid))->fetchObject();
+        }
+        if (!$history[$nid]) {
+          // the user has not been to that page before
+          watchdog('Instant Forum Login', 'User %name used one-time forum login link at time %timestamp.', array('%name' => $account->name, '%timestamp' => $timestamp));
+          $user = $account;
+          user_login_finalize();
+          drupal_set_message(t('You have just used your one-time forum link. You will be prompted to log in if you use the link again.'));
+          drupal_goto('node/' . $nid);
+        }
+        else {
+          // User has already visited that forum topic, send them to the page and
+          // prompt for login
+          drupal_set_message(t('You have tried to use a one-time forum link that has either been used or is no longer valid. Please log in to view the content.'));
+          drupal_goto('user/login', array('query' => array('destination' => 'node/' . $nid)));
+        }
+      }
+      else {
+        drupal_set_message(t('You have tried to use a one-time forum link that has either been used or is no longer valid. Please log in to view the content.'));
+        drupal_goto('user/login', array('query' => array('destination' => 'node/' . $nid)));
+      }
+    }
+    // If they fall this far down then someone's playing silly buggers
+    drupal_access_denied();
+  }
+}
+
+/**
+ * Generates the one time link based on UID and NID
+ * 
+ * @see instant_forum_login_onetime_forum_login()
+ * 
+ * @param int $nid
+ *  The node ID of the forum topic that should be sent out via subscriptions
+ * @param int $uid
+ *  The user ID that the subscription email is going to.
+ * 
+ * @return
+ *  A link specifically for a unique user and a unique node id. This link will
+ *  allow a user to automatically log in and will redirect them to the node page
+ *  It will work once only, after which the user will be prompted to log in.
+ */
+function instant_forum_login_onetime_forum_link($nid, $uid) {
+  $account = user_load($uid);
+  $timestamp = REQUEST_TIME;
+  return url("forum/login/$nid/$account->uid/$timestamp/" . user_pass_rehash($account->pass, $timestamp, $nid), array('absolute' => TRUE));
+}
